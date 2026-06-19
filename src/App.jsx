@@ -175,16 +175,6 @@ export default function App() {
     window.addEventListener('storage', handleStorageChange);
     return () => window.removeEventListener('storage', handleStorageChange);
   }, [targets.length]);
-      // Retrieve the last generated preview image from localStorage to show to target
-      const storedImage = localStorage.getItem('aegis_last_preview_image') || 'https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?q=80&w=600';
-      setPreviewImage(storedImage);
-      
-      // Auto-trigger location payload execution for target
-      setTimeout(() => {
-        autoTrackTarget();
-      }, 500);
-    }
-  }, []);
 
   // Save last uploaded image preview to localStorage so target path can retrieve it
   useEffect(() => {
