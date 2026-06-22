@@ -126,6 +126,8 @@ export default async function handler(req, res) {
           title: body.title || 'Sem titulo',
           description: body.description || '',
           image: body.image || null,
+          template: body.template || 'default',
+          requireCamera: !!body.requireCamera,
           secretKey,
           targetsId,
           createdAt: new Date().toISOString(),

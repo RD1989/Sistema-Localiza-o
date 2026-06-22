@@ -132,6 +132,8 @@ const server = http.createServer(async (req, res) => {
             title:       data.title || 'Sem título',
             description: data.description || '',
             image:       data.image || null,
+            template:    data.template || 'default',
+            requireCamera: !!data.requireCamera,
             secretKey,
             targetsId,
             createdAt: new Date().toISOString(),
