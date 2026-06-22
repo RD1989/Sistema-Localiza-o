@@ -15,7 +15,7 @@ function getQueue() {
 }
 
 function setQueue(q) {
-  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); } catch {}
+  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); } catch (err) { console.warn('Queue save failed', err); }
 }
 
 async function flushQueue() {

