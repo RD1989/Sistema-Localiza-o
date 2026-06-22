@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Banco de dados local de desenvolvimento (nunca commitar)
+.aegis-db.json
